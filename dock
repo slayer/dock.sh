@@ -1,0 +1,221 @@
+#!/bin/bash
+
+DOCKENV=${DOCKENV:-"./.dockenv"}
+
+if [ ! -r ${DOCKENV} ]; then
+  if [ -r "${DOCKENV}-default" ]; then
+    echo
+    echo -e "\e[33mUsing ${DOCKENV}-default as template...\e[0m"
+    echo
+    echo -e "\e[37mPlease make sure you have done \e[31m docker login\e[0m before pull (see passwords.txt for login/pass)"
+    echo
+    grep -A100 "<CONTAINER_SPECIFIC>" "${DOCKENV}-default" | \
+        grep -B100 "</CONTAINER_SPECIFIC>" | \
+        sed -e 's/^/# /' > ${DOCKENV}
+  else
+    echo "Error: unable to find ${DOCKENV}"
+    exit 1
+  fi
+fi
+
+source "${DOCKENV}-default"
+source "${DOCKENV}"
+
+function build() {
+  [ -f Gemfile -a -x "`which bundle`" ] && bundle package --all
+  docker build -t ${IMAGE_NAME} .
+}
+
+function ensure_network() {
+  docker network inspect ${DOCKNET_NAME} >/dev/null 2>&1 && return
+  docker network create --ip-range=${DOCKNET_RANGE} --subnet=${DOCKNET_RANGE} --gateway ${DOCKNET_GW} ${DOCKNET_NAME}
+}
+
+function rm_network() {
+  docker network rm ${DOCKNET_NAME}
+}
+
+function ensure_data() {
+  if ! docker inspect ${DATACONTAINER_NAME} >/dev/null 2>&1; then
+    local opts=""
+    for vol in $DATA_VOLUMES; do
+      opts="$opts -v $vol"
+    done
+    docker create $opts --name ${DATACONTAINER_NAME} alpine:latest /bin/true
+  fi
+}
+
+function rm_data() {
+  docker rm -v ${DATACONTAINER_NAME}
+}
+
+function rm_if_exists() {
+  local n=$(docker ps -a -f "name=${CONTAINER_NAME}$" --format "{{.Names}}")
+  if [ "a${n}a" != "aa" ]; then
+    docker rm -v ${CONTAINER_NAME}
+  fi
+}
+
+function run() {
+  rm_if_exists
+  ensure_data
+  ensure_network
+  if [ -z "${DETACHED}" ]; then
+    RUN_ARGS="${RUN_ARGS} --rm -it $@"
+  else
+    RUN_ARGS="${RUN_ARGS} -d $@"
+  fi
+  docker run ${RUN_ARGS} ${IMAGE_NAME}
+}
+
+function start() {
+  docker start $@ ${CONTAINER_NAME}
+}
+
+function stop() {
+  docker stop $@ ${CONTAINER_NAME}
+}
+
+function rm() {
+  docker rm $@ ${CONTAINER_NAME}
+}
+
+function logs() {
+  docker logs $@ ${CONTAINER_NAME}
+}
+
+function shell() {
+  docker exec -it ${CONTAINER_NAME} su - app
+}
+
+function appexec() {
+  docker exec -it ${CONTAINER_NAME} su - app -c "cd /app && $@"
+}
+
+function rails() {
+  appexec "bundle exec rails $@"
+}
+
+function rake() {
+  appexec "bundle exec rake $@"
+}
+
+function psql() {
+  appexec "psql -U ${DB_USER} ${DB_NAME} $@"
+}
+
+function mysql() {
+  local opts="--user=${DB_USER} "
+  [ ! -z "${DB_PASS}" ] && opts="$opts -p${DB_PASS}"
+  appexec "mysql $opts ${DB_NAME} $@"
+}
+
+function _exec() {
+  docker exec -i ${CONTAINER_NAME} $@
+}
+
+function container_id() {
+  docker ps -q -f name=${CONTAINER_NAME}
+}
+
+function isrun() {
+  [ ! -z $(container_id) ]
+}
+
+function init() {
+  ensure_network
+  ensure_data
+}
+
+function pg_load() {
+  local file="${1}"
+  if [ -z ${DB_NAME} -o -z "${DB_USER}" ]; then
+    echo "Please set DB_NAME and DB_USER environment variable, like:"
+    echo "  DB_NAME=pv_dev DB_USER=app ./dock load_pg /tmp/pv_dev.sql"
+    exit 1;
+  fi
+  if [ ${file} = "-" ]; then
+    file=""
+  fi
+
+  local cmd="docker exec -i ${CONTAINER_NAME} psql -U ${DB_USER} ${DB_NAME}"
+  cat ${file} | ${cmd}
+}
+
+function pg_dump() {
+  pg_dump --no-privileges --no-owner $DB_NAME
+}
+
+function push() {
+  docker tag $IMAGE_NAME $REMOTE_NAME
+  docker push $REMOTE_NAME
+}
+
+function pull() {
+  docker pull $REMOTE_NAME
+  docker tag $REMOTE_NAME $IMAGE_NAME
+}
+
+function info() {
+  echo "main container: ${CONTAINER_NAME}"
+  echo "main image: ${REMOTE_NAME}"
+  echo "data container: ${CONTAINER_NAME}"
+  echo "data image: ${DATACONTAINER_NAME}"
+  echo "container_id: $(container_id)"
+  echo "run: $(isrun && echo "true" || echo "false")"
+}
+
+function mongo_backup() {
+  docker run --rm --volumes-from  -v $(pwd):/backup alpine tar cvf /backup/docker_aytm_stats_full.tar /var/lib/mongodb
+}
+
+function mongo_restore() {
+
+  if docker inspect ${DATACONTAINER_NAME} >/dev/null 2>&1; then
+    docker rm -v ${DATACONTAINER_NAME}
+  fi
+  create_data
+
+  docker run --rm --volumes-from aytmstats_data -v $(pwd):/backup alpine tar xvf /backup/docker_aytm_stats_full.tar
+}
+
+function help() {
+echo "Usage: $0"
+echo "       init           - prepare environment at first time"
+echo "       ensure_data    - creates empty data container if the data container does not already exist"
+echo "       ensure_network - creates network if the network does not already exist"
+echo -e "       rm_data        - removes data container. \e[31m WARNING! no undo available\e[0m"
+echo "       rm_network     - removes docker's network"
+echo "       info           - show information"
+echo "       build          - builds image"
+echo "       run            - create and start container"
+echo "       start          - start created container"
+echo "       stop           - stop running container"
+echo "       logs           - show logs (-f for follow)"
+echo "       rm             - remove container"
+echo "       shell          - start shell in running container"
+echo "       psql           - run psql in running container"
+echo "       mysql          - run mysql in running container"
+echo "       rails          - run rails in running container"
+echo "       rake           - run rake in running container"
+echo "       mongo_backup   - backup mongodb"
+echo "       mongo_restore  - restore mongodb"
+echo "       exec cmd       - execute command in running container. e.g. /bin/bash"
+echo "       push           - push image to repository"
+echo "       pull           - pull image from repository"
+}
+
+cmd=$1
+if [ -z "$cmd" ]; then
+  help
+  exit 0
+fi
+
+[ "$cmd" = "exec" -o $cmd == "e" ] && cmd="_exec"
+[ "$cmd" = "sh" ] && cmd="shell"
+[ "$cmd" = "b" ] && cmd="build"
+[ "$cmd" = "r" ] && cmd="run"
+[ "$cmd" = "ra" ] && cmd="rails"
+
+shift
+$cmd $@
