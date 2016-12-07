@@ -15,7 +15,7 @@ docker login
 * Install docker
 ```
 sudo apt-get install wget && wget -qO- https://get.docker.com/ | sh
-sudo usermod -aG docker <username>
+sudo usermod -aG docker `whoami`
 ```
 or use sudo before the dock commands
 
